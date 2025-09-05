@@ -33,15 +33,19 @@ from datetime import datetime
 
 # Third-party imports
 import fitz  # PyMuPDF for PDF processing
-import chromadb
-from chromadb.config import Settings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
+from langchain_chroma import Chroma  # Use the specific langchain-chroma import
+from langchain.schema import Document
 import tiktoken
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
+
+# Disable ChromaDB telemetry BEFORE any ChromaDB operations
+# This ensures no telemetry data is sent to external servers (enterprise requirement)
+os.environ["ANONYMIZED_TELEMETRY"] = "false"
 
 # Setup comprehensive logging
 def setup_logging():
@@ -86,7 +90,7 @@ class Config:
 
 class SmartEmbeddingProvider:
     """
-    Smart embedding provider that tries OpenAI first, falls back to sentence-transformers.
+    Smart embedding provider that supports Azure OpenAI, OpenAI, and falls back to sentence-transformers.
     """
     
     def __init__(self):
@@ -96,7 +100,32 @@ class SmartEmbeddingProvider:
     
     def _initialize_embeddings(self):
         """Initialize embeddings with fallback strategy."""
-        # Try OpenAI first
+        # Try Azure OpenAI first using the proven working pattern
+        azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+        azure_api_key = os.getenv("AZURE_OPENAI_API_KEY")
+        azure_deployment = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-ada-002")
+        azure_api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2023-12-01-preview")
+        
+        if azure_endpoint and azure_api_key:
+            try:
+                from langchain_openai import AzureOpenAIEmbeddings
+                # Use the exact pattern that works: base_url, openai_api_key, model, api_version, openai_api_type
+                self.embeddings = AzureOpenAIEmbeddings(
+                    base_url=azure_endpoint,
+                    openai_api_key=azure_api_key,
+                    model=azure_deployment,
+                    api_version=azure_api_version,
+                    openai_api_type="azure"
+                )
+                self.provider_type = "azure_openai"
+                logger.info(f"Using Azure OpenAI embeddings with deployment: {azure_deployment}")
+                return
+            except ImportError:
+                logger.warning("Azure OpenAI not available, trying standard OpenAI")
+            except Exception as e:
+                logger.warning(f"Azure OpenAI embeddings failed: {e}, trying standard OpenAI")
+        
+        # Try standard OpenAI
         openai_api_key = os.getenv("OPENAI_API_KEY")
         if openai_api_key:
             try:
@@ -115,19 +144,17 @@ class SmartEmbeddingProvider:
         
         # Fallback to sentence-transformers
         try:
-            from sentence_transformers import SentenceTransformer
-            self.embeddings = SentenceTransformer('all-MiniLM-L6-v2')
+            from langchain_community.embeddings import SentenceTransformerEmbeddings
+            self.embeddings = SentenceTransformerEmbeddings(model_name='all-MiniLM-L6-v2')
             self.provider_type = "sentence_transformers"
             logger.info("Using sentence-transformers embeddings")
         except ImportError:
-            raise ImportError("Neither OpenAI nor sentence-transformers available. Install one of them.")
+            raise ImportError("Neither Azure OpenAI, OpenAI, nor sentence-transformers available. Install one of them.")
     
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         """Embed documents using the available provider."""
-        if self.provider_type == "openai":
+        if self.provider_type in ["openai", "azure_openai", "sentence_transformers"]:
             return self.embeddings.embed_documents(texts)
-        elif self.provider_type == "sentence_transformers":
-            return self.embeddings.encode(texts).tolist()
         else:
             raise ValueError("No embedding provider available")
 
@@ -137,7 +164,7 @@ class TokenAwareTextSplitter:
     Text splitter that respects token limits (500-1000 tokens with 100 overlap).
     """
     
-    def __init__(self, min_tokens: int = 500, max_tokens: int = 1000, overlap_tokens: int = 100):
+    def __init__(self, min_tokens: int = 100, max_tokens: int = 1000, overlap_tokens: int = 100):
         self.min_tokens = min_tokens
         self.max_tokens = max_tokens
         self.overlap_tokens = overlap_tokens
@@ -403,112 +430,158 @@ class SAP_EWM_PDFProcessor:
         return chunks
 
 
-class ChromaDBManager:
+class LangchainChromaManager:
     """
-    Manage ChromaDB operations with idempotent behavior.
+    Manage Langchain Chroma operations with idempotent behavior.
     """
     
     def __init__(self, db_path: str = "./chroma", collection_name: str = "sap_ewm_docs"):
         self.db_path = Path(db_path)
         self.collection_name = collection_name
-        self.embeddings = SmartEmbeddingProvider()
+        self.embeddings_provider = SmartEmbeddingProvider()
+        self.vectorstore = None
         
-        # Initialize ChromaDB
+        # Disable ChromaDB telemetry for enterprise environments
+        os.environ["ANONYMIZED_TELEMETRY"] = "false"
+        
+        # Initialize directory
         self.db_path.mkdir(parents=True, exist_ok=True)
-        self.client = chromadb.PersistentClient(
-            path=str(self.db_path),
-            settings=Settings(anonymized_telemetry=False)
-        )
         
     def reset_collection(self):
         """Reset collection for clean rebuild (idempotent behavior)."""
-        try:
-            # Delete existing collection
-            self.client.delete_collection(name=self.collection_name)
-            logger.info(f"Deleted existing collection: {self.collection_name}")
-        except Exception:
-            pass  # Collection didn't exist
+        # Remove existing directory if it exists
+        if self.db_path.exists() and any(self.db_path.iterdir()):
+            shutil.rmtree(self.db_path)
+            logger.info(f"Deleted existing Chroma database: {self.db_path}")
         
-        # Create fresh collection
-        self.collection = self.client.create_collection(
-            name=self.collection_name,
-            metadata={"description": "SAP EWM training documents"}
-        )
-        logger.info(f"Created fresh collection: {self.collection_name}")
+        # Recreate directory
+        self.db_path.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Reset Chroma database directory: {self.db_path}")
     
-    def get_or_create_collection(self):
-        """Get existing or create new collection."""
-        try:
-            self.collection = self.client.get_collection(name=self.collection_name)
-            logger.info(f"Using existing collection: {self.collection_name}")
-        except Exception:
-            self.collection = self.client.create_collection(
-                name=self.collection_name,
-                metadata={"description": "SAP EWM training documents"}
-            )
-            logger.info(f"Created new collection: {self.collection_name}")
-    
-    def index_chunks(self, chunks: List[Dict[str, Any]], batch_size: int = 50):
-        """Index document chunks into ChromaDB."""
+    def index_chunks(self, chunks: List[Dict[str, Any]], batch_size: int = 100):
+        """Index document chunks into Langchain Chroma using batch processing pattern."""
         if not chunks:
             logger.warning("No chunks to index")
             return
         
-        logger.info(f"Indexing {len(chunks)} chunks in batches of {batch_size}")
+        logger.info(f"Indexing {len(chunks)} chunks into Langchain Chroma using batch processing")
         
-        # Process in batches
-        for i in range(0, len(chunks), batch_size):
-            batch = chunks[i:i + batch_size]
+        # Convert chunks to Langchain Documents
+        documents = []
+        for chunk in chunks:
+            doc = Document(
+                page_content=chunk['text'],
+                metadata=chunk['metadata']
+            )
+            documents.append(doc)
+        
+        try:
+            # Process in batches using the proven pattern:
+            # - First batch: use Chroma.from_documents() to create the vectorstore
+            # - Subsequent batches: use add_documents() on the existing vectorstore
             
-            # Prepare batch data
-            texts = [chunk['text'] for chunk in batch]
-            metadatas = [chunk['metadata'] for chunk in batch]
-            ids = [chunk['metadata']['chunk_id'] for chunk in batch]
+            total_batches = (len(documents) + batch_size - 1) // batch_size
+            logger.info(f"Processing {len(documents)} documents in {total_batches} batch(es) of {batch_size}")
             
-            # Generate embeddings
-            try:
-                embeddings = self.embeddings.embed_documents(texts)
+            for batch_idx in range(total_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min((batch_idx + 1) * batch_size, len(documents))
+                batch_docs = documents[start_idx:end_idx]
                 
-                # Add to ChromaDB
-                self.collection.add(
-                    documents=texts,
-                    metadatas=metadatas,
-                    ids=ids,
-                    embeddings=embeddings
-                )
+                logger.info(f"Processing batch {batch_idx + 1}/{total_batches} ({len(batch_docs)} documents)")
                 
-                logger.info(f"Indexed batch {i//batch_size + 1} ({len(batch)} chunks)")
-                
-            except Exception as e:
-                logger.error(f"Failed to index batch {i//batch_size + 1}: {e}")
-                raise
+                if batch_idx == 0:
+                    # First batch: create vectorstore with from_documents
+                    self.vectorstore = Chroma.from_documents(
+                        batch_docs,
+                        embedding=self.embeddings_provider.embeddings,
+                        persist_directory=str(self.db_path)
+                    )
+                    logger.info(f"Created vectorstore with first batch of {len(batch_docs)} documents")
+                else:
+                    # Subsequent batches: add to existing vectorstore
+                    self.vectorstore.add_documents(batch_docs)
+                    logger.info(f"Added batch {batch_idx + 1} with {len(batch_docs)} documents")
+            
+            logger.info(f"Successfully indexed all {len(chunks)} chunks using batch processing pattern")
+            
+        except Exception as e:
+            logger.error(f"Failed to index chunks into Chroma: {e}")
+            logger.error(f"Error details: {type(e).__name__}: {str(e)}")
+            raise
+    
+    def create_vectorstore_simple(self, documents: List[Document]) -> Chroma:
+        """Create Chroma vectorstore using the most reliable pattern.
+        
+        This method uses the exact pattern that works reliably:
+        db = Chroma.from_documents(documents, embedding=embeddings, persist_directory='./path')
+        """
+        try:
+            logger.info(f"Creating Chroma vectorstore with {len(documents)} documents using the reliable pattern")
+            
+            # Use the exact pattern that always works
+            vectorstore = Chroma.from_documents(
+                documents,  # First argument: documents list
+                embedding=self.embeddings_provider.embeddings,  # Named parameter: embedding function
+                persist_directory=str(self.db_path)  # Named parameter: persist directory
+            )
+            
+            logger.info(f"Successfully created Chroma vectorstore using the reliable from_documents pattern")
+            return vectorstore
+            
+        except Exception as e:
+            logger.error(f"Failed to create vectorstore: {e}")
+            logger.error(f"Error details: {type(e).__name__}: {str(e)}")
+            raise
     
     def get_collection_stats(self) -> Dict[str, Any]:
         """Get statistics about the collection."""
         try:
-            count = self.collection.count()
+            if not self.vectorstore:
+                # Try to load existing vectorstore using the proven working pattern
+                if self.db_path.exists() and any(self.db_path.iterdir()):
+                    self.vectorstore = Chroma(
+                        persist_directory=str(self.db_path),
+                        embedding_function=self.embeddings_provider.embeddings
+                    )
+                else:
+                    return {'total_chunks': 0, 'source_files': [], 'unique_tags': [], 'collection_name': self.collection_name}
             
-            # Get sample metadata for analysis
-            sample_result = self.collection.get(limit=10)
-            
-            # Analyze tags and source files
-            all_tags = set()
-            source_files = set()
-            
-            if sample_result['metadatas']:
-                for meta in sample_result['metadatas']:
-                    if 'tags' in meta:
-                        all_tags.update(meta['tags'])
+            # Get some documents to analyze
+            try:
+                # Try to get sample documents
+                sample_docs = self.vectorstore.similarity_search("SAP EWM", k=10)
+                
+                # Analyze metadata
+                all_tags = set()
+                source_files = set()
+                total_chunks = len(sample_docs)  # This is a rough estimate
+                
+                for doc in sample_docs:
+                    meta = doc.metadata
+                    if 'tags' in meta and meta['tags']:
+                        # Split comma-separated tags
+                        tags = [tag.strip() for tag in str(meta['tags']).split(',')]
+                        all_tags.update(tags)
                     if 'source_file' in meta:
                         source_files.add(meta['source_file'])
-            
-            return {
-                'total_chunks': count,
-                'source_files': list(source_files),
-                'unique_tags': list(all_tags),
-                'collection_name': self.collection_name
-            }
-            
+                
+                return {
+                    'total_chunks': total_chunks,  # Approximate count
+                    'source_files': list(source_files),
+                    'unique_tags': list(all_tags),
+                    'collection_name': self.collection_name
+                }
+                
+            except Exception as e:
+                logger.warning(f"Could not get sample documents for stats: {e}")
+                return {
+                    'total_chunks': 'Unknown',
+                    'source_files': [],
+                    'unique_tags': [],
+                    'collection_name': self.collection_name
+                }
+                
         except Exception as e:
             logger.error(f"Failed to get collection stats: {e}")
             return {'error': str(e)}
@@ -550,7 +623,7 @@ def main():
     try:
         # Initialize components
         processor = SAP_EWM_PDFProcessor()
-        db_manager = ChromaDBManager(db_path=chroma_dir)
+        db_manager = LangchainChromaManager(db_path=chroma_dir)
         
         # Reset collection for clean rebuild (idempotent)
         print("\n🔄 Resetting ChromaDB collection for clean rebuild...")
